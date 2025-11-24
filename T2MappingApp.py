@@ -1,5 +1,8 @@
 import sys
 import numpy as np
+import os
+import pickle
+import hashlib
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QLabel, QPushButton, QGroupBox,
                              QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox, QStyledItemDelegate)
@@ -96,21 +99,95 @@ class T2MappingApp(QMainWindow):
         self.roi_points = []
         self.roi_active = False
         self.current_t2_color_map = 'viridis'
+        
+        # Cache directory
+        self.cache_dir = '.cache'
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         self.load_image()
         
         self.init_ui()
         self.update_display()
+    
+    def get_cache_key(self, file_path):
+        """Generate a unique cache key based on file path and modification time"""
+        try:
+            file_stat = os.stat(file_path)
+            cache_key = f"{file_path}_{file_stat.st_mtime}_{file_stat.st_size}"
+            return hashlib.md5(cache_key.encode()).hexdigest()
+        except:
+            return None
+    
+    def get_cache_path(self, cache_key):
+        """Get the path to the cache file"""
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
+    
+    def load_from_cache(self, cache_path):
+        """Load processed data from cache"""
+        try:
+            print(f"Loading from cache: {cache_path}")
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            
+            self.original_data = cached_data['original_data']
+            self.data = cached_data['data']
+            self.t2_map = cached_data['t2_map']
+            self.s0_map = cached_data['s0_map']
+            self.te_values = cached_data['te_values']
+            self.n_slices = cached_data['n_slices']
+            self.n_echoes = cached_data['n_echoes']
+            print("Successfully loaded from cache!")
+            return True
+        except Exception as e:
+            print(f"Failed to load from cache: {e}")
+            return False
+    
+    def save_to_cache(self, cache_path):
+        """Save processed data to cache"""
+        try:
+            print(f"Saving to cache: {cache_path}")
+            cache_data = {
+                'original_data': self.original_data,
+                'data': self.data,
+                't2_map': self.t2_map,
+                's0_map': self.s0_map,
+                'te_values': self.te_values,
+                'n_slices': self.n_slices,
+                'n_echoes': self.n_echoes
+            }
+            with open(cache_path, 'wb') as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+            print("Successfully saved to cache!")
+        except Exception as e:
+            print(f"Failed to save to cache: {e}")
 
     def load_image(self, file_path='prostate_010.nii.gz'):
-        img = img = nib.load(file_path)
+        """Load image data with caching support"""
+        # Check if cache exists
+        cache_key = self.get_cache_key(file_path)
+        cache_path = self.get_cache_path(cache_key) if cache_key else None
+        
+        if cache_path and os.path.exists(cache_path):
+            # Try to load from cache
+            if self.load_from_cache(cache_path):
+                return
+        
+        # No cache or cache load failed, process from scratch
+        print(f"Loading and processing {file_path}...")
+        img = nib.load(file_path)
         data = img.get_fdata()
         self.te_values = np.linspace(13.2, 145.2, 10)
+        print("Calculating T2 map...")
         self.t2_map, self.s0_map = calculate_t2_map(data[:, :, self.current_slice, :], self.te_values / 1000)
         self.original_data = data.copy()
         self.data = data.copy()
         self.n_slices = data.shape[2]
         self.n_echoes = data.shape[3]
+        print("Processing complete!")
+        
+        # Save to cache for next time
+        if cache_path:
+            self.save_to_cache(cache_path)
 
         
     # def generate_synthetic_data(self):
