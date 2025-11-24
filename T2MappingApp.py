@@ -2,8 +2,9 @@ import sys
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QSlider, QLabel, QPushButton, QGroupBox,
-                             QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox, QStyledItemDelegate)
-from PyQt5.QtCore import Qt, QPointF, QSize
+                             QSpinBox, QDoubleSpinBox, QMessageBox, QComboBox, QStyledItemDelegate,
+                             QCheckBox, QDialog)
+from PyQt5.QtCore import Qt, QPointF, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QLinearGradient, QIcon
 import pyqtgraph as pg
 from scipy.optimize import curve_fit
@@ -71,6 +72,30 @@ class ColormapDelegate(QStyledItemDelegate):
         return QSize(option.rect.width(), 30)
     
 
+class T2MapWorker(QThread):
+    finished = pyqtSignal(np.ndarray, np.ndarray)
+
+    def __init__(self, data, te_values, even_numbered):
+        super().__init__()
+        self.data = data
+        self.te_values = te_values
+        self.even_numbered = even_numbered
+
+    def run(self):
+        t2_map, s0_map = calculate_t2_map(self.data, self.te_values, even_numbered_echos=self.even_numbered)
+        self.finished.emit(t2_map, s0_map)
+
+class WaitingDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setModal(True)
+        self.setWindowTitle("Calculating T2 Map...")
+        self.setFixedSize(300, 100)
+        layout = QVBoxLayout()
+        label = QLabel("Please wait, calculating T2 map...")
+        layout.addWidget(label)
+        self.setLayout(layout)
+
 class T2MappingApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -100,13 +125,13 @@ class T2MappingApp(QMainWindow):
         self.load_image()
         
         self.init_ui()
+        self.calculate_t2_map_background()
         self.update_display()
 
     def load_image(self, file_path='prostate_010.nii.gz'):
         img = img = nib.load(file_path)
         data = img.get_fdata()
         self.te_values = np.linspace(13.2, 145.2, 10)
-        self.t2_map, self.s0_map = calculate_t2_map(data[:, :, self.current_slice, :], self.te_values / 1000)
         self.original_data = data.copy()
         self.data = data.copy()
         self.n_slices = data.shape[2]
@@ -192,9 +217,16 @@ class T2MappingApp(QMainWindow):
         # T2 Mapping Control
         t2_group = QGroupBox("T2 Mapping")
         t2_layout = QVBoxLayout()
+
+        button_checkbox_layout = QHBoxLayout()
         self.calc_t2_btn = QPushButton("Calculate T2 Map")
-        self.calc_t2_btn.clicked.connect(self.calculate_t2_map)
-        t2_layout.addWidget(self.calc_t2_btn)
+        self.calc_t2_btn.clicked.connect(self.calculate_t2_map_background)
+        button_checkbox_layout.addWidget(self.calc_t2_btn)
+        
+        self.even_numbered_echos_chckbx = QCheckBox("Use Even numbered Echos")
+        self.even_numbered_echos_chckbx.setChecked(True)
+        button_checkbox_layout.addWidget(self.even_numbered_echos_chckbx)
+        t2_layout.addLayout(button_checkbox_layout)
         
         # Color scheme selector
         colormap_layout = QHBoxLayout()
@@ -306,33 +338,46 @@ class T2MappingApp(QMainWindow):
         self.update_display()
         if self.selected_pixel:
             self.plot_signal_decay()
+
+    def calculate_t2_map_background(self):
+        data_to_fit = self.noisy_data if self.noisy_data is not None else self.original_data
+
+        self.wait_dialog = WaitingDialog(self)
+        self.wait_dialog.show()
+
+        self.worker = T2MapWorker(
+            data=data_to_fit[:, :, self.current_slice],
+            te_values=self.te_values / 1000,
+            even_numbered=self.even_numbered_echos_chckbx.isChecked()
+        )
+        self.worker.finished.connect(self.on_t2_map_finished)
+        self.worker.start()
+
+    def on_t2_map_finished(self, t2_map, s0_map):
+        if self.noisy_data is not None:
+            self.noisy_t2_map = t2_map
+            self.noisy_s0_map = s0_map
+        else:
+            self.t2_map = t2_map
+            self.s0_map = s0_map
+
+        self.update_display()
+        self.wait_dialog.close()
+        QMessageBox.information(self, "T2 Mapping", "T2 map calculation complete!")
             
     def calculate_t2_map(self):
         """Calculate T2 map using exponential fitting"""
         # Use noisy data if available, otherwise original
         data_to_fit = self.noisy_data if self.noisy_data is not None else self.original_data
         
-        t2_map = np.zeros((self.img_size, self.img_size))
-        
-        # Fit T2 for each pixel
-        for i in range(self.img_size):
-            for j in range(self.img_size):
-                signal = data_to_fit[:, i, j]
-                try:
-                    # Fit exponential decay: S = S0 * exp(-TE/T2)
-                    popt, _ = curve_fit(lambda te, s0, t2: s0 * np.exp(-te / t2),
-                                       self.te_values, signal,
-                                       p0=[signal[0], 50],
-                                       bounds=([0, 1], [np.inf, 200]),
-                                       maxfev=1000)
-                    t2_map[i, j] = popt[1]
-                except:
-                    t2_map[i, j] = 0
+        t2_map, s0_map = calculate_t2_map(data_to_fit[:, :, self.current_slice], self.te_values / 1000, even_numbered_echos=self.even_numbered_echos_chckbx.isChecked())
         
         if self.noisy_data is not None:
             self.noisy_t2_map = t2_map
+            self.noisy_s0_map = s0_map
         else:
             self.t2_map = t2_map
+            self.s0_map = s0_map
             
         self.update_display()
         QMessageBox.information(self, "T2 Mapping", "T2 map calculation complete!")
@@ -454,12 +499,7 @@ class T2MappingApp(QMainWindow):
         # Display T2 map
         t2_to_show = self.noisy_t2_map if self.noisy_t2_map is not None else self.t2_map
         if t2_to_show is not None:
-            # Apply colormap - try matplotlib first, fall back to pyqtgraph built-in
-            try:
-                colormap = pg.colormap.get(self.current_colormap, source='matplotlib')
-            except:
-                # Fall back to pyqtgraph colormaps if matplotlib not available
-                colormap = pg.colormap.get(self.current_t2_color_map)
+            colormap = pg.colormap.get(self.current_t2_color_map)
             
             if colormap is not None:
                 self.t2_widget.setColorMap(colormap)
