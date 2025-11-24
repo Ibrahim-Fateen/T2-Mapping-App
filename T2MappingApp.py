@@ -128,6 +128,9 @@ class T2MappingApp(QMainWindow):
         # Cache directory
         self.cache_dir = '.cache'
         os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # ROI overlay items for cleanup
+        self.roi_overlay_items = []
 
         self.load_image()
         
@@ -355,6 +358,7 @@ class T2MappingApp(QMainWindow):
         self.t2_widget = pg.ImageView()
         self.t2_widget.ui.roiBtn.hide()
         self.t2_widget.ui.menuBtn.hide()
+        self.t2_widget.getView().scene().sigMouseClicked.connect(self.on_t2_map_clicked)
         middle_panel.addWidget(QLabel("T2 Map"))
         middle_panel.addWidget(self.t2_widget)
         
@@ -466,14 +470,30 @@ class T2MappingApp(QMainWindow):
             x, y = int(mouse_point.x()), int(mouse_point.y())
             
             if 0 <= x < self.img_size and 0 <= y < self.img_size:
+                if not self.roi_active:
+                    self.selected_pixel = (y, x)
+                    self.plot_signal_decay()
+    
+    def on_t2_map_clicked(self, event):
+        """Handle mouse click on T2 map for ROI drawing"""
+        pos = event.scenePos()
+        if self.t2_widget.getImageItem().sceneBoundingRect().contains(pos):
+            mouse_point = self.t2_widget.getView().mapSceneToView(pos)
+            x, y = int(mouse_point.x()), int(mouse_point.y())
+            
+            # Get the shape of the current T2 map
+            t2_to_show = self.noisy_t2_map if self.noisy_t2_map is not None else self.t2_map
+            if t2_to_show is None:
+                return
+            
+            img_height, img_width = t2_to_show.shape
+            
+            if 0 <= x < img_width and 0 <= y < img_height:
                 if self.roi_active:
                     self.roi_points.append((y, x))
                     self.update_display()
                     if len(self.roi_points) >= 3:
                         self.calculate_roi_stats()
-                else:
-                    self.selected_pixel = (y, x)
-                    self.plot_signal_decay()
                     
     def plot_signal_decay(self):
         """Plot signal decay curve for selected pixel"""
@@ -533,36 +553,81 @@ class T2MappingApp(QMainWindow):
         self.roi_btn.setChecked(False)
         self.roi_btn.setText("Draw ROI")
         self.roi_stats_label.setText("ROI Stats:\nNo ROI selected")
+        # Remove ROI overlay items immediately
+        self.draw_roi_overlay()
         self.update_display()
         
     def calculate_roi_stats(self):
-        """Calculate statistics within ROI"""
+        """Calculate comprehensive statistics within ROI"""
         if len(self.roi_points) < 3:
             return
             
         # Create mask from ROI points
         from matplotlib.path import Path
+        
+        # Get the current T2 map to determine dimensions
+        t2_to_show = self.noisy_t2_map if self.noisy_t2_map is not None else self.t2_map
+        if t2_to_show is None:
+            return
+        
+        img_height, img_width = t2_to_show.shape
         roi_path = Path([(x, y) for y, x in self.roi_points])
         
-        y_grid, x_grid = np.meshgrid(np.arange(self.img_size), np.arange(self.img_size))
+        y_grid, x_grid = np.meshgrid(np.arange(img_height), np.arange(img_width))
         points = np.vstack((x_grid.flatten(), y_grid.flatten())).T
-        mask = roi_path.contains_points(points).reshape(self.img_size, self.img_size)
+        mask = roi_path.contains_points(points).reshape(img_height, img_width)
         
         stats_text = "ROI Stats:\n"
+        stats_text += f"Pixels in ROI: {np.sum(mask)}\n\n"
         
         # Calculate T2 statistics for original data
         if self.t2_map is not None:
             roi_t2_orig = self.t2_map[mask]
-            stats_text += f"Original T2: {np.mean(roi_t2_orig):.2f} ± {np.std(roi_t2_orig):.2f} ms\n"
+            # Filter out zeros
+            roi_t2_orig = roi_t2_orig[roi_t2_orig > 0]
+            
+            if len(roi_t2_orig) > 0:
+                avg_t2 = np.mean(roi_t2_orig)
+                std_t2 = np.std(roi_t2_orig)
+                cv_t2 = (std_t2 / avg_t2) * 100 if avg_t2 > 0 else 0
+                
+                stats_text += "Original T2 Map:\n"
+                stats_text += f"  Mean: {avg_t2:.3f} s ({avg_t2*1000:.2f} ms)\n"
+                stats_text += f"  Std Dev: {std_t2:.3f} s ({std_t2*1000:.2f} ms)\n"
+                stats_text += f"  CV: {cv_t2:.2f}%\n"
+                stats_text += f"  Min: {np.min(roi_t2_orig):.3f} s\n"
+                stats_text += f"  Max: {np.max(roi_t2_orig):.3f} s\n\n"
         
         # Calculate T2 statistics for noisy data
         if self.noisy_t2_map is not None:
             roi_t2_noisy = self.noisy_t2_map[mask]
-            stats_text += f"Noisy T2: {np.mean(roi_t2_noisy):.2f} ± {np.std(roi_t2_noisy):.2f} ms\n"
+            # Filter out zeros
+            roi_t2_noisy = roi_t2_noisy[roi_t2_noisy > 0]
             
-            if self.t2_map is not None:
-                diff = np.mean(roi_t2_orig) - np.mean(roi_t2_noisy)
-                stats_text += f"Mean Difference: {diff:.2f} ms"
+            if len(roi_t2_noisy) > 0:
+                avg_t2_noisy = np.mean(roi_t2_noisy)
+                std_t2_noisy = np.std(roi_t2_noisy)
+                cv_t2_noisy = (std_t2_noisy / avg_t2_noisy) * 100 if avg_t2_noisy > 0 else 0
+                
+                stats_text += "Noisy T2 Map:\n"
+                stats_text += f"  Mean: {avg_t2_noisy:.3f} s ({avg_t2_noisy*1000:.2f} ms)\n"
+                stats_text += f"  Std Dev: {std_t2_noisy:.3f} s ({std_t2_noisy*1000:.2f} ms)\n"
+                stats_text += f"  CV: {cv_t2_noisy:.2f}%\n"
+                stats_text += f"  Min: {np.min(roi_t2_noisy):.3f} s\n"
+                stats_text += f"  Max: {np.max(roi_t2_noisy):.3f} s\n\n"
+                
+                # Calculate comparison metrics if both exist
+                if self.t2_map is not None and len(roi_t2_orig) > 0:
+                    # Compute RMSE and MAE
+                    rmse = np.sqrt(np.mean((roi_t2_orig - roi_t2_noisy)**2))
+                    mae = np.mean(np.abs(roi_t2_orig - roi_t2_noisy))
+                    mean_diff = avg_t2 - avg_t2_noisy
+                    
+                    stats_text += "Comparison (Original vs Noisy):\n"
+                    stats_text += f"  RMSE: {rmse:.3f} s ({rmse*1000:.2f} ms)\n"
+                    stats_text += f"  MAE: {mae:.3f} s ({mae*1000:.2f} ms)\n"
+                    stats_text += f"  Mean Diff: {mean_diff:.3f} s ({mean_diff*1000:.2f} ms)\n"
+                    stats_text += f"  Std Dev Diff: {(std_t2 - std_t2_noisy)*1000:.2f} ms"
         
         self.roi_stats_label.setText(stats_text)
         
@@ -584,7 +649,7 @@ class T2MappingApp(QMainWindow):
         
         # Display difference map
         if self.noisy_data is not None:
-            diff_map = self.original_data[:, :, self.current_slice, self.current_te] - self.noisy_data[self.current_slice, :, :, self.current_te]
+            diff_map = self.original_data[:, :, self.current_slice, self.current_te] - self.noisy_data[:, :, self.current_slice, self.current_te]
             self.diff_widget.setImage(diff_map, autoRange=False, autoLevels=False)
         
         # Draw ROI if points exist
@@ -592,13 +657,48 @@ class T2MappingApp(QMainWindow):
             self.draw_roi_overlay()
             
     def draw_roi_overlay(self):
-        """Draw ROI overlay on image"""
+        """Draw ROI overlay on T2 map"""
+        # Clear existing ROI items
+        view = self.t2_widget.getView()
+        for item in self.roi_overlay_items:
+            try:
+                view.removeItem(item)
+            except:
+                pass
+        self.roi_overlay_items = []
+        
         if not self.roi_points:
             return
         
-        # This is a simplified visualization - for production you'd want to use
-        # pyqtgraph's ROI tools or custom graphics items
-        pass  # ROI visualization handled by click feedback
+        # Draw ROI points as scatter plot
+        if len(self.roi_points) > 0:
+            x_coords = [p[1] for p in self.roi_points]
+            y_coords = [p[0] for p in self.roi_points]
+            
+            # Draw points
+            scatter = pg.ScatterPlotItem(
+                x=x_coords, 
+                y=y_coords, 
+                size=10, 
+                pen=pg.mkPen('r', width=2),
+                brush=pg.mkBrush(255, 0, 0, 120)
+            )
+            view.addItem(scatter)
+            self.roi_overlay_items.append(scatter)
+            
+            # Draw lines connecting points
+            if len(self.roi_points) >= 2:
+                # Add first point at the end to close the polygon
+                x_coords_closed = x_coords + [x_coords[0]]
+                y_coords_closed = y_coords + [y_coords[0]]
+                
+                line = pg.PlotDataItem(
+                    x=x_coords_closed,
+                    y=y_coords_closed,
+                    pen=pg.mkPen('r', width=2)
+                )
+                view.addItem(line)
+                self.roi_overlay_items.append(line)
 
 def main():
     app = QApplication(sys.argv)
