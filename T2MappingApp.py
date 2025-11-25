@@ -280,14 +280,14 @@ class T2MappingApp(QMainWindow):
         noise_group = QGroupBox("Noise Control")
         noise_layout = QVBoxLayout()
         noise_hlayout = QHBoxLayout()
-        noise_hlayout.addWidget(QLabel("Noise Level (%):"))
+        noise_hlayout.addWidget(QLabel("Noise Level - SNR:"))
         self.noise_spinbox = QDoubleSpinBox()
-        self.noise_spinbox.setRange(0, 50)
-        self.noise_spinbox.setValue(0)
-        self.noise_spinbox.setSingleStep(1)
+        self.noise_spinbox.setRange(1, 50)
+        self.noise_spinbox.setValue(25)
+        self.noise_spinbox.setSingleStep(2)
         noise_hlayout.addWidget(self.noise_spinbox)
         noise_layout.addLayout(noise_hlayout)
-        self.add_noise_btn = QPushButton("Add Noise")
+        self.add_noise_btn = QPushButton("Add Noise per slice")
         self.add_noise_btn.clicked.connect(self.add_noise)
         noise_layout.addWidget(self.add_noise_btn)
         noise_group.setLayout(noise_layout)
@@ -401,20 +401,26 @@ class T2MappingApp(QMainWindow):
         
     def add_noise(self):
         """Add Gaussian noise to the data"""
-        self.noise_level = self.noise_spinbox.value()
-        if self.noise_level == 0:
+        snr = self.noise_spinbox.value()
+
+        if snr <= 1:
+            snr = 1
+
+        if snr is None or snr <= 0:
             self.noisy_data = None
             self.noisy_t2_map = None
         else:
-            # Add Gaussian noise as percentage of signal
-            noise_std = self.noise_level / 100.0
             self.noisy_data = self.original_data.copy()
+
             for i in range(self.n_echoes):
-                noise = np.random.normal(0, noise_std * np.mean(self.original_data[i]), 
-                                        (self.img_size, self.img_size))
-                self.noisy_data[i] = self.original_data[i] + noise
-                self.noisy_data[i] = np.maximum(self.noisy_data[i], 0)  # Ensure non-negative
+                signal_mean = np.mean(self.original_data[:, :, self.current_slice, i])
+                noise_std = signal_mean / snr
+
+                noise = np.random.normal(0, noise_std, (self.img_size, self.img_size))
+                self.noisy_data[:, :, self.current_slice, i] = self.original_data[:, :, self.current_slice, i] + noise
+                self.noisy_data[:, :, self.current_slice, i] = np.maximum(self.noisy_data[:, :, self.current_slice, i], 0)  # Ensure non-negative
         
+        self.calculate_t2_map_background()
         self.update_display()
         if self.selected_pixel:
             self.plot_signal_decay()
@@ -532,10 +538,10 @@ class T2MappingApp(QMainWindow):
         if self.noisy_t2_map is not None and self.noisy_data is not None:
             t2_noisy = self.noisy_t2_map[x, y]
             s0_noisy = self.noisy_s0_map[x, y]
-            fitted_noisy = s0_noisy * np.exp(-te_fine / t2_noisy)
+            fitted_noisy = s0_noisy * np.exp(-te_fine / (t2_noisy * 1000))
             self.signal_plot.plot(te_fine, fitted_noisy,
                                  pen=pg.mkPen('m', width=2, style=Qt.DashLine),
-                                 name=f'Noisy Fit (T2={t2_noisy:.1f}ms)')
+                                 name=f'Noisy Fit (T2={t2_noisy:.3f}s)')
         
     def toggle_roi_mode(self):
         """Toggle ROI drawing mode"""
@@ -648,8 +654,8 @@ class T2MappingApp(QMainWindow):
             self.t2_widget.setImage(t2_to_show, autoRange=False, autoLevels=False)
         
         # Display difference map
-        if self.noisy_data is not None:
-            diff_map = self.original_data[:, :, self.current_slice, self.current_te] - self.noisy_data[:, :, self.current_slice, self.current_te]
+        if self.noisy_t2_map is not None:
+            diff_map = self.t2_map - self.noisy_t2_map
             self.diff_widget.setImage(diff_map, autoRange=False, autoLevels=False)
         
         # Draw ROI if points exist
